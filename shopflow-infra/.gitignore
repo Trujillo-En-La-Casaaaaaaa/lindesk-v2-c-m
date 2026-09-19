@@ -1,0 +1,7 @@
+# Verification state written by the restart-durability phases of scripts/verify-e2e.mjs
+# (bind-mounted into the `verify` container at /verify-state).
+verify-state/*
+!verify-state/.gitkeep
+
+# Node dependencies of the notification provider emulator
+node_modules/

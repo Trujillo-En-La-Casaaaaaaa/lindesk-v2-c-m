@@ -1,0 +1,10 @@
+node_modules
+dist
+coverage
+.git
+.gitignore
+.handoff
+.env
+.env.*
+!.env.example
+*.log

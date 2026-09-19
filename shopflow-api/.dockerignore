@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+.git
+.gitignore
+.handoff
+.env
+.env.*
+!.env.example
+tests
+*.log
+docker-compose.test.yml
+README.md

@@ -1,0 +1,165 @@
+# =============================================================================
+# ShopFlow — deterministic local runtime (docker compose)
+# -----------------------------------------------------------------------------
+# Integration owner for the three-tier system: PostgreSQL 16, the notification
+# provider emulator, one-shot migrate/seed jobs, the API, the web bundle, and the
+# profile-scoped black-box verification suite.
+#
+#   docker compose up -d --build --wait
+#   docker compose --profile verify run --rm -e VERIFY_PHASE=full verify
+#   docker compose down -v
+#
+# Requires Docker Compose v2.17.0+ (depends_on.condition:
+# service_completed_successfully, --wait). Sibling repositories are expected at
+# ../shopflow-api and ../shopflow-web; override the build contexts and every
+# published port through the variables documented in .env.example.
+# =============================================================================
+name: shopflow
+
+services:
+  # --- PostgreSQL 16 with a bounded, UTC server configuration ----------------
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "config_file=/etc/shopflow/postgresql.conf"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shopflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shopflow_local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-shopflow}
+      TZ: UTC
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/shopflow/postgresql.conf:ro
+    healthcheck:
+      # `$$` escapes compose interpolation so the container shell expands the variables.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- Deterministic local notification-provider emulator -------------------
+  # Dependency-free Node.js 20 service; the API calls it at
+  # http://notification-emulator:4010 and it deduplicates on Idempotency-Key.
+  notification-emulator:
+    build:
+      context: ./notification-emulator
+    environment:
+      PORT: 4010
+    ports:
+      - "${EMULATOR_HOST_PORT:-4010}:4010"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4010/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # --- One-shot migration job (runs the API image's migrate entrypoint) -----
+  migrate:
+    image: shopflow-api:local
+    build:
+      context: ${API_BUILD_CONTEXT:-../shopflow-api}
+    command: ["node", "dist/main/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-shopflow}:${POSTGRES_PASSWORD:-shopflow_local_dev_only}@postgres:5432/${POSTGRES_DB:-shopflow}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # --- One-shot deterministic seed job (after migrations completed) --------
+  seed:
+    image: shopflow-api:local
+    build:
+      context: ${API_BUILD_CONTEXT:-../shopflow-api}
+    command: ["node", "dist/main/seed.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-shopflow}:${POSTGRES_PASSWORD:-shopflow_local_dev_only}@postgres:5432/${POSTGRES_DB:-shopflow}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # --- API (starts only after the seed job exited 0) ------------------------
+  api:
+    image: shopflow-api:local
+    build:
+      context: ${API_BUILD_CONTEXT:-../shopflow-api}
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://${POSTGRES_USER:-shopflow}:${POSTGRES_PASSWORD:-shopflow_local_dev_only}@postgres:5432/${POSTGRES_DB:-shopflow}
+      NOTIFICATION_PROVIDER_URL: http://notification-emulator:4010
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-250}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${API_HOST_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      notification-emulator:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- Static web bundle, built with the API base URL baked in -------------
+  web:
+    image: shopflow-web:local
+    build:
+      context: ${WEB_BUILD_CONTEXT:-../shopflow-web}
+      args:
+        VITE_API_BASE_URL: ${WEB_API_BASE_URL:-http://localhost:8080}
+    ports:
+      - "${WEB_HOST_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Black-box end-to-end verification (never part of the default up) ----
+  verify:
+    profiles: ["verify"]
+    image: node:20-alpine
+    working_dir: /scripts
+    command: ["node", "verify-e2e.mjs"]
+    environment:
+      API_BASE_URL: http://api:8080
+      EMULATOR_BASE_URL: http://notification-emulator:4010
+      VERIFY_PHASE: ${VERIFY_PHASE:-full}
+      VERIFY_STATE_DIR: /verify-state
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./verify-state:/verify-state
+    depends_on:
+      api:
+        condition: service_healthy
+      notification-emulator:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+volumes:
+  postgres-data:
